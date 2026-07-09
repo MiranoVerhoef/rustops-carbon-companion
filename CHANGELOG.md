@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.5 — 2026-07-10
+
+- Treat short-lived WebSocket sessions as failures so unstable proxies eventually pause retries.
+- Throttle repeated successful-connection notices in the game console.
+
 ## 0.5.4 — 2026-07-09
 
 - Added smarter WebSocket reconnect backoff.

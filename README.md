@@ -2,7 +2,7 @@
 
 Open-source Carbon production-channel companion. It opens only an outbound WSS connection and never exposes a new inbound port.
 
-Current version: **0.5.4** · Protocol: **v1**
+Current version: **0.5.5** · Protocol: **v1**
 
 1. Copy `RustOpsCompanion.cs` to `carbon/plugins`.
 2. In dashboard, generate pairing code.
@@ -13,6 +13,7 @@ Commands:
 
 - `rustops.pair CODE [URL]` — pair or rotate the device credential.
 - `rustops.status` — pairing, connection, service, protocol, and capabilities.
+- `rustops.retry` — immediately resume and force a connection attempt after a retry pause.
 - `rustops.update` — immediately check for and install a newer verified release.
 - `rustops.autoupdate true|false` — control automatic verified updates.
 - `rustops.version` — installed companion version and build.

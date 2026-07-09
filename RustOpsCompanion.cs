@@ -18,14 +18,15 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.5.4")]
+[Info("RustOpsCompanion", "RustOps", "0.5.5")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.5.4";
-    private const string CompanionBuild = "2026.07.09.5";
+    private const string CompanionVersion = "0.5.5";
+    private const string CompanionBuild = "2026.07.10.1";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
+    private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
     private ClientWebSocket socket;
     private int connectionGeneration;
@@ -33,6 +34,7 @@ public class RustOpsCompanion : CarbonPlugin
     private DateTime pausedUntilUtc = DateTime.MinValue;
     private DateTime nextRetryUtc = DateTime.MinValue;
     private string lastConnectionError = "";
+    private DateTime lastConnectedLogUtc = DateTime.MinValue;
     private CompanionSettings settings;
     private string pendingPairingCode;
     private System.Threading.Timer updateTimer;
@@ -156,6 +158,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.5.5: Short-lived WebSocket connections now count as failures; connection logs are throttled.\n" +
         "v0.5.4: Smarter WebSocket reconnect backoff, pause-after-failures, rustops.retry command, and clearer status.\n" +
         "v0.5.3: Prevent duplicate WebSocket receive loops after pairing/reconnect.\n" +
         "v0.5.2: Manual rustops.update command and dashboard update trigger.\n" +
@@ -196,9 +199,21 @@ public class RustOpsCompanion : CarbonPlugin
                 else socket.Options.SetRequestHeader("Authorization", $"Bearer {settings.DeviceToken}");
                 await socket.ConnectAsync(new Uri(settings.ServiceUrl), shutdown.Token);
                 if (generation != connectionGeneration) return;
-                attempt = 0; consecutiveConnectionFailures = 0; pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue; lastConnectionError = ""; Puts("Connected to RustOps control plane.");
+                var connectedAtUtc = DateTime.UtcNow;
+                pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue;
+                AnnounceConnected();
                 await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
                 await ReceiveLoop(generation, socket);
+                if (generation != connectionGeneration || shutdown.IsCancellationRequested) return;
+                var connectedSeconds = (DateTime.UtcNow - connectedAtUtc).TotalSeconds;
+                if (connectedSeconds < StableConnectionSeconds)
+                    HandleConnectionFailure(new WebSocketException($"WebSocket closed after {Math.Max(1, (int)connectedSeconds)} second(s)."));
+                else
+                {
+                    attempt = 0;
+                    consecutiveConnectionFailures = 0;
+                    lastConnectionError = "";
+                }
             }
             catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { return; }
             catch (OperationCanceledException) when (generation != connectionGeneration) { return; }
@@ -225,6 +240,13 @@ public class RustOpsCompanion : CarbonPlugin
         }
         if (consecutiveConnectionFailures == 1 || consecutiveConnectionFailures == 3)
             PrintWarning($"Connection lost: {error.Message}. Retrying with backoff.");
+    }
+
+    private void AnnounceConnected()
+    {
+        if (DateTime.UtcNow - lastConnectedLogUtc < TimeSpan.FromMinutes(1)) return;
+        lastConnectedLogUtc = DateTime.UtcNow;
+        Puts("Connected to RustOps control plane.");
     }
 
     private TimeSpan RetryDelay(int attempt)
