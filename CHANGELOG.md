@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3 — 2026-07-09
+
+- Prevented duplicate WebSocket receive loops after pairing or reconnecting.
+
 ## 0.5.2 — 2026-07-09
 
 - Added `rustops.update`.

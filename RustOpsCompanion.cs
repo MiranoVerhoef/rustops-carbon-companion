@@ -18,16 +18,17 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.5.2")]
+[Info("RustOpsCompanion", "RustOps", "0.5.3")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.5.2";
-    private const string CompanionBuild = "2026.07.09.3";
+    private const string CompanionVersion = "0.5.3";
+    private const string CompanionBuild = "2026.07.09.4";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private readonly CancellationTokenSource shutdown = new();
     private ClientWebSocket socket;
+    private int connectionGeneration;
     private CompanionSettings settings;
     private string pendingPairingCode;
     private System.Threading.Timer updateTimer;
@@ -76,7 +77,7 @@ public class RustOpsCompanion : CarbonPlugin
     private void OnServerInitialized()
     {
         LoadSettings();
-        if (!string.IsNullOrWhiteSpace(settings.DeviceToken)) _ = ConnectionLoop();
+        if (!string.IsNullOrWhiteSpace(settings.DeviceToken)) StartConnectionLoop();
         ConfigureUpdateTimer();
     }
 
@@ -99,8 +100,7 @@ public class RustOpsCompanion : CarbonPlugin
             settings.ServiceUrl = uri.ToString();
         }
         pendingPairingCode = arg.Args[0].ToString(); settings.DeviceToken = ""; SaveSettings();
-        try { socket?.Abort(); } catch { }
-        _ = ConnectionLoop();
+        StartConnectionLoop();
         arg.ReplyWith("RustOps pairing started.");
     }
 
@@ -138,6 +138,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.5.3: Prevent duplicate WebSocket receive loops after pairing/reconnect.\n" +
         "v0.5.2: Manual rustops.update command and dashboard update trigger.\n" +
         "v0.5.1: WebSocket-pushed update availability and immediate verified auto-update.\n" +
         "v0.5.0: Custom dashboard chat sender without the SERVER prefix.\n" +
@@ -149,10 +150,17 @@ public class RustOpsCompanion : CarbonPlugin
         "v0.2.0: Carbon production compatibility; detailed pairing/status; companion version handshake; legacy runtime file/hash support.\n" +
         "v0.1.0: Initial pairing, plugin lifecycle, and JSON configuration bridge.");
 
-    private async Task ConnectionLoop()
+    private void StartConnectionLoop()
+    {
+        var generation = Interlocked.Increment(ref connectionGeneration);
+        try { socket?.Abort(); } catch { }
+        _ = ConnectionLoop(generation);
+    }
+
+    private async Task ConnectionLoop(int generation)
     {
         var attempt = 0;
-        while (!shutdown.IsCancellationRequested)
+        while (!shutdown.IsCancellationRequested && generation == connectionGeneration)
         {
             try
             {
@@ -160,13 +168,15 @@ public class RustOpsCompanion : CarbonPlugin
                 if (!string.IsNullOrEmpty(pendingPairingCode)) socket.Options.SetRequestHeader("X-Pairing-Code", pendingPairingCode);
                 else socket.Options.SetRequestHeader("Authorization", $"Bearer {settings.DeviceToken}");
                 await socket.ConnectAsync(new Uri(settings.ServiceUrl), shutdown.Token);
+                if (generation != connectionGeneration) return;
                 attempt = 0; Puts("Connected to RustOps control plane.");
                 await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
-                await ReceiveLoop();
+                await ReceiveLoop(generation, socket);
             }
             catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (generation != connectionGeneration) { return; }
             catch (Exception error) { PrintWarning($"Connection lost: {error.Message}"); }
-            if (!shutdown.IsCancellationRequested) await Task.Delay(Math.Min(30000, 1000 * (1 << Math.Min(attempt++, 5))), shutdown.Token);
+            if (!shutdown.IsCancellationRequested && generation == connectionGeneration) await Task.Delay(Math.Min(30000, 1000 * (1 << Math.Min(attempt++, 5))), shutdown.Token);
         }
     }
 
@@ -180,15 +190,15 @@ public class RustOpsCompanion : CarbonPlugin
         return bytes.Length == 4 && (bytes[0] == 10 || bytes[0] == 127 || (bytes[0] == 192 && bytes[1] == 168) || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31));
     }
 
-    private async Task ReceiveLoop()
+    private async Task ReceiveLoop(int generation, ClientWebSocket activeSocket)
     {
         var buffer = new byte[64 * 1024];
-        while (socket.State == WebSocketState.Open && !shutdown.IsCancellationRequested)
+        while (activeSocket.State == WebSocketState.Open && !shutdown.IsCancellationRequested && generation == connectionGeneration)
         {
             using var stream = new MemoryStream(); WebSocketReceiveResult result;
             do
             {
-                result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), shutdown.Token);
+                result = await activeSocket.ReceiveAsync(new ArraySegment<byte>(buffer), shutdown.Token);
                 if (result.MessageType == WebSocketMessageType.Close) return;
                 stream.Write(buffer, 0, result.Count);
                 if (stream.Length > MaxConfigBytes + 65536) throw new InvalidDataException("Protocol message too large.");

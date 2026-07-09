@@ -2,7 +2,7 @@
 
 Open-source Carbon production-channel companion. It opens only an outbound WSS connection and never exposes a new inbound port.
 
-Current version: **0.5.2** · Protocol: **v1**
+Current version: **0.5.3** · Protocol: **v1**
 
 1. Copy `RustOpsCompanion.cs` to `carbon/plugins`.
 2. In dashboard, generate pairing code.
