@@ -18,17 +18,21 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.5.3")]
+[Info("RustOpsCompanion", "RustOps", "0.5.4")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.5.3";
-    private const string CompanionBuild = "2026.07.09.4";
+    private const string CompanionVersion = "0.5.4";
+    private const string CompanionBuild = "2026.07.09.5";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private readonly CancellationTokenSource shutdown = new();
     private ClientWebSocket socket;
     private int connectionGeneration;
+    private int consecutiveConnectionFailures;
+    private DateTime pausedUntilUtc = DateTime.MinValue;
+    private DateTime nextRetryUtc = DateTime.MinValue;
+    private string lastConnectionError = "";
     private CompanionSettings settings;
     private string pendingPairingCode;
     private System.Threading.Timer updateTimer;
@@ -109,10 +113,12 @@ public class RustOpsCompanion : CarbonPlugin
         $"RustOps Companion v{CompanionVersion} ({CompanionBuild})\n" +
         $"Protocol: v{ProtocolVersion}\n" +
         $"Paired: {!string.IsNullOrWhiteSpace(settings?.DeviceToken)}\n" +
-        $"Connection: {socket?.State.ToString() ?? "Not started"}\n" +
+        $"Connection: {ConnectionLabel()}\n" +
+        $"Next retry: {RetryLabel()}\n" +
+        $"Last error: {(string.IsNullOrWhiteSpace(lastConnectionError) ? "none" : lastConnectionError)}\n" +
         $"Service: {settings?.ServiceUrl ?? "Not configured"}\n" +
         $"Auto update: {(settings?.AutoUpdate == true ? "enabled" : "disabled")}\n" +
-        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.autoupdate");
+        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.autoupdate, companion.retry");
 
     [ConsoleCommand("rustops.autoupdate")]
     private void AutoUpdate(ConsoleSystem.Arg arg)
@@ -136,8 +142,21 @@ public class RustOpsCompanion : CarbonPlugin
         _ = CheckForUpdate();
     }
 
+    [ConsoleCommand("rustops.retry")]
+    private void Retry(ConsoleSystem.Arg arg)
+    {
+        if (arg.Connection != null && arg.Connection.authLevel < 2) { arg.ReplyWith("Admin level 2 required."); return; }
+        consecutiveConnectionFailures = 0;
+        pausedUntilUtc = DateTime.MinValue;
+        nextRetryUtc = DateTime.MinValue;
+        lastConnectionError = "";
+        StartConnectionLoop();
+        arg.ReplyWith("RustOps connection retry forced.");
+    }
+
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.5.4: Smarter WebSocket reconnect backoff, pause-after-failures, rustops.retry command, and clearer status.\n" +
         "v0.5.3: Prevent duplicate WebSocket receive loops after pairing/reconnect.\n" +
         "v0.5.2: Manual rustops.update command and dashboard update trigger.\n" +
         "v0.5.1: WebSocket-pushed update availability and immediate verified auto-update.\n" +
@@ -152,6 +171,8 @@ public class RustOpsCompanion : CarbonPlugin
 
     private void StartConnectionLoop()
     {
+        pausedUntilUtc = DateTime.MinValue;
+        nextRetryUtc = DateTime.MinValue;
         var generation = Interlocked.Increment(ref connectionGeneration);
         try { socket?.Abort(); } catch { }
         _ = ConnectionLoop(generation);
@@ -164,21 +185,58 @@ public class RustOpsCompanion : CarbonPlugin
         {
             try
             {
+                if (pausedUntilUtc > DateTime.UtcNow)
+                {
+                    nextRetryUtc = pausedUntilUtc;
+                    await Task.Delay(TimeUntil(pausedUntilUtc), shutdown.Token);
+                    continue;
+                }
                 socket?.Dispose(); socket = new ClientWebSocket();
                 if (!string.IsNullOrEmpty(pendingPairingCode)) socket.Options.SetRequestHeader("X-Pairing-Code", pendingPairingCode);
                 else socket.Options.SetRequestHeader("Authorization", $"Bearer {settings.DeviceToken}");
                 await socket.ConnectAsync(new Uri(settings.ServiceUrl), shutdown.Token);
                 if (generation != connectionGeneration) return;
-                attempt = 0; Puts("Connected to RustOps control plane.");
-                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
+                attempt = 0; consecutiveConnectionFailures = 0; pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue; lastConnectionError = ""; Puts("Connected to RustOps control plane.");
+                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
                 await ReceiveLoop(generation, socket);
             }
             catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { return; }
             catch (OperationCanceledException) when (generation != connectionGeneration) { return; }
-            catch (Exception error) { PrintWarning($"Connection lost: {error.Message}"); }
-            if (!shutdown.IsCancellationRequested && generation == connectionGeneration) await Task.Delay(Math.Min(30000, 1000 * (1 << Math.Min(attempt++, 5))), shutdown.Token);
+            catch (Exception error) { HandleConnectionFailure(error); }
+            if (!shutdown.IsCancellationRequested && generation == connectionGeneration)
+            {
+                var delay = RetryDelay(attempt++);
+                nextRetryUtc = DateTime.UtcNow.Add(delay);
+                await Task.Delay(delay, shutdown.Token);
+            }
         }
     }
+
+    private void HandleConnectionFailure(Exception error)
+    {
+        lastConnectionError = error.Message;
+        consecutiveConnectionFailures++;
+        if (consecutiveConnectionFailures >= 6)
+        {
+            var minutes = Math.Min(30, 5 * (1 + ((consecutiveConnectionFailures - 6) / 3)));
+            pausedUntilUtc = DateTime.UtcNow.AddMinutes(minutes);
+            PrintWarning($"Connection lost: {error.Message}. Pausing retries for {minutes} minute(s). Run rustops.retry to force retry.");
+            return;
+        }
+        if (consecutiveConnectionFailures == 1 || consecutiveConnectionFailures == 3)
+            PrintWarning($"Connection lost: {error.Message}. Retrying with backoff.");
+    }
+
+    private TimeSpan RetryDelay(int attempt)
+    {
+        if (pausedUntilUtc > DateTime.UtcNow) return TimeUntil(pausedUntilUtc);
+        var seconds = Math.Min(60, 2 * (1 << Math.Min(attempt, 5)));
+        return TimeSpan.FromSeconds(seconds + UnityEngine.Random.Range(0, 4));
+    }
+
+    private static TimeSpan TimeUntil(DateTime utc) => TimeSpan.FromMilliseconds(Math.Max(1000, (utc - DateTime.UtcNow).TotalMilliseconds));
+    private string ConnectionLabel() => pausedUntilUtc > DateTime.UtcNow ? "Paused" : socket?.State.ToString() ?? "Not started";
+    private string RetryLabel() => nextRetryUtc > DateTime.UtcNow ? nextRetryUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "not scheduled";
 
     private static bool IsAllowedServiceUri(Uri uri)
     {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4 — 2026-07-09
+
+- Added smarter WebSocket reconnect backoff.
+- Pauses repeated failed connections instead of spamming console logs.
+- Added `rustops.retry` to force a reconnect attempt.
+- Expanded `rustops.status` with next retry and last error.
+
 ## 0.5.3 — 2026-07-09
 
 - Prevented duplicate WebSocket receive loops after pairing or reconnecting.
