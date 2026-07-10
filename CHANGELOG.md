@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0 — 2026-07-10
+
+- Rejects incompatible or malformed control-plane protocol messages clearly.
+- Serializes WebSocket writes to prevent overlapping `SendAsync` failures.
+- Adds working remote companion status, automatic-update, and retry operations.
+- Restores plugin configuration backups using atomic file replacement.
+- Reports observed plugin load state and recent Carbon compilation errors.
+
 ## 0.5.5 — 2026-07-10
 
 - Treat short-lived WebSocket sessions as failures so unstable proxies eventually pause retries.

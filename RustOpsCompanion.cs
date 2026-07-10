@@ -18,16 +18,17 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.5.5")]
+[Info("RustOpsCompanion", "RustOps", "0.6.0")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.5.5";
-    private const string CompanionBuild = "2026.07.10.1";
+    private const string CompanionVersion = "0.6.0";
+    private const string CompanionBuild = "2026.07.10.2";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
+    private readonly SemaphoreSlim sendLock = new(1, 1);
     private ClientWebSocket socket;
     private int connectionGeneration;
     private int consecutiveConnectionFailures;
@@ -39,6 +40,8 @@ public class RustOpsCompanion : CarbonPlugin
     private string pendingPairingCode;
     private System.Threading.Timer updateTimer;
     private readonly Dictionary<ulong, PendingWarning> pendingWarnings = new();
+    private readonly Dictionary<string, string> compileErrors = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> loadedPlugins = new(StringComparer.OrdinalIgnoreCase);
     private static readonly string ConfigRoot = Path.Combine("carbon", "configs");
     private string SettingsPath => Path.Combine(ConfigRoot, "RustOpsCompanion.json");
 
@@ -58,6 +61,7 @@ public class RustOpsCompanion : CarbonPlugin
         public string state;
         public string description;
         public bool hasConfig;
+        public string compileError;
     }
 
     private sealed class ProtocolMessage
@@ -95,6 +99,30 @@ public class RustOpsCompanion : CarbonPlugin
         try { socket?.Abort(); socket?.Dispose(); } catch { }
     }
 
+    private void OnPluginCompileFailure(string plugin, Exception error)
+    {
+        if (string.IsNullOrWhiteSpace(plugin)) return;
+        compileErrors[Path.GetFileNameWithoutExtension(plugin)] = error?.Message ?? "Compilation failed.";
+        loadedPlugins.Remove(Path.GetFileNameWithoutExtension(plugin));
+    }
+
+    private void OnPluginLoaded(object plugin)
+    {
+        var name = PluginObjectName(plugin); if (string.IsNullOrWhiteSpace(name)) return;
+        compileErrors.Remove(name); loadedPlugins.Add(name);
+    }
+
+    private void OnPluginUnloaded(object plugin)
+    {
+        var name = PluginObjectName(plugin); if (!string.IsNullOrWhiteSpace(name)) loadedPlugins.Remove(name);
+    }
+
+    private static string PluginObjectName(object plugin)
+    {
+        try { return plugin?.GetType().GetProperty("Name")?.GetValue(plugin, null)?.ToString(); }
+        catch { return null; }
+    }
+
     [ConsoleCommand("rustops.pair")]
     private void Pair(ConsoleSystem.Arg arg)
     {
@@ -120,7 +148,7 @@ public class RustOpsCompanion : CarbonPlugin
         $"Last error: {(string.IsNullOrWhiteSpace(lastConnectionError) ? "none" : lastConnectionError)}\n" +
         $"Service: {settings?.ServiceUrl ?? "Not configured"}\n" +
         $"Auto update: {(settings?.AutoUpdate == true ? "enabled" : "disabled")}\n" +
-        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.autoupdate, companion.retry");
+        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.status, companion.autoupdate, companion.retry");
 
     [ConsoleCommand("rustops.autoupdate")]
     private void AutoUpdate(ConsoleSystem.Arg arg)
@@ -158,6 +186,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.6.0: Strict protocol handling, serialized WebSocket sends, remote status/update controls, and atomic config rollback.\n" +
         "v0.5.5: Short-lived WebSocket connections now count as failures; connection logs are throttled.\n" +
         "v0.5.4: Smarter WebSocket reconnect backoff, pause-after-failures, rustops.retry command, and clearer status.\n" +
         "v0.5.3: Prevent duplicate WebSocket receive loops after pairing/reconnect.\n" +
@@ -284,12 +313,21 @@ public class RustOpsCompanion : CarbonPlugin
                 if (stream.Length > MaxConfigBytes + 65536) throw new InvalidDataException("Protocol message too large.");
             } while (!result.EndOfMessage);
             var message = JsonConvert.DeserializeObject<ProtocolMessage>(Encoding.UTF8.GetString(stream.ToArray()));
-            if (message == null || message.ProtocolVersion != ProtocolVersion) continue;
+            if (message == null || string.IsNullOrWhiteSpace(message.RequestId) || string.IsNullOrWhiteSpace(message.Operation))
+                throw new InvalidDataException("Malformed RustOps protocol message.");
+            if (message.ProtocolVersion != ProtocolVersion)
+            {
+                lastConnectionError = $"Unsupported protocol v{message.ProtocolVersion}; this companion requires v{ProtocolVersion}.";
+                await activeSocket.CloseAsync(WebSocketCloseStatus.ProtocolError, lastConnectionError, shutdown.Token);
+                return;
+            }
             if (message.Operation == "paired")
             {
-                settings.DeviceToken = message.Payload?["token"]?.Value<string>() ?? ""; pendingPairingCode = null; SaveSettings(); Puts("Pairing complete; device credential saved."); continue;
+                var token = message.Payload?["token"]?.Value<string>();
+                if (string.IsNullOrWhiteSpace(token)) throw new InvalidDataException("Pairing response did not contain a device credential.");
+                settings.DeviceToken = token; pendingPairingCode = null; SaveSettings(); Puts("Pairing complete; device credential saved."); continue;
             }
-            _ = Handle(message);
+            await Handle(message);
         }
     }
 
@@ -309,6 +347,9 @@ public class RustOpsCompanion : CarbonPlugin
                 "player.warn" => await OnMainThread(() => WarnPlayer(request)),
                 "chat.send" => await OnMainThread(() => SendChat(request)),
                 "companion.update" => QueueUpdate(request),
+                "companion.status" => CompanionStatus(),
+                "companion.autoupdate" => SetAutoUpdate(request),
+                "companion.retry" => QueueRetry(),
                 _ => throw new InvalidOperationException("Unsupported operation.")
             };
             await Send(new ProtocolMessage { RequestId = request.RequestId, Operation = request.Operation, Success = true, Payload = payload == null ? null : JToken.FromObject(payload) });
@@ -329,14 +370,17 @@ public class RustOpsCompanion : CarbonPlugin
             var source = File.ReadAllText(file);
             var info = Regex.Match(source, "\\[Info\\s*\\(\\s*\\\"([^\\\"]+)\\\"\\s*,\\s*\\\"([^\\\"]+)\\\"\\s*,\\s*\\\"([^\\\"]+)\\\"\\s*\\)\\]");
             var description = Regex.Match(source, "\\[Description\\s*\\(\\s*\\\"([^\\\"]*)\\\"\\s*\\)\\]");
+            var id = Path.GetFileNameWithoutExtension(file);
+            compileErrors.TryGetValue(id, out var compileError);
             plugins.Add(new PluginSummary {
-                id = Path.GetFileNameWithoutExtension(file),
+                id = id,
                 name = info.Success ? info.Groups[1].Value : Path.GetFileNameWithoutExtension(file),
                 author = info.Success ? info.Groups[2].Value : "Unknown",
                 version = info.Success ? info.Groups[3].Value : "Unknown",
-                state = "installed",
+                state = !string.IsNullOrWhiteSpace(compileError) ? "compile_error" : loadedPlugins.Contains(id) ? "loaded" : "installed",
                 description = description.Success ? description.Groups[1].Value : "",
-                hasConfig = File.Exists(ResolveConfigPath(Path.GetFileNameWithoutExtension(file)))
+                hasConfig = File.Exists(ResolveConfigPath(id)),
+                compileError = compileError
             });
         }
         return new { plugins = plugins.OrderBy(plugin => plugin.name).ToArray() };
@@ -396,7 +440,10 @@ public class RustOpsCompanion : CarbonPlugin
         var backup = Directory.Exists(folder) ? new DirectoryInfo(folder).GetFiles("*.json").OrderByDescending(file => file.CreationTimeUtc).FirstOrDefault() : null;
         if (backup == null) throw new FileNotFoundException("No config backup available.");
         var current = File.Exists(path) ? File.ReadAllBytes(path) : Array.Empty<byte>(); var bytes = File.ReadAllBytes(backup.FullName);
-        if (current.Length > 0) Backup(plugin, current); File.WriteAllBytes(path, bytes); return new { revision = Revision(bytes) };
+        if (current.Length > 0) Backup(plugin, current);
+        var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
+        if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
+        return new { revision = Revision(bytes) };
     }
 
     private object WarnPlayer(ProtocolMessage request)
@@ -430,6 +477,33 @@ public class RustOpsCompanion : CarbonPlugin
         Puts($"RustOps control plane announced companion v{available}; starting verified update.");
         _ = CheckForUpdate();
         return new { accepted = true, manual = force, availableVersion = available };
+    }
+
+    private object CompanionStatus() => new
+    {
+        version = CompanionVersion,
+        build = CompanionBuild,
+        protocolVersion = ProtocolVersion,
+        paired = !string.IsNullOrWhiteSpace(settings?.DeviceToken),
+        connection = ConnectionLabel(),
+        nextRetry = RetryLabel(),
+        lastError = lastConnectionError,
+        autoUpdate = settings?.AutoUpdate == true
+    };
+
+    private object SetAutoUpdate(ProtocolMessage request)
+    {
+        var enabled = request.Payload?["enabled"]?.Value<bool?>() ?? throw new InvalidDataException("enabled boolean required.");
+        settings.AutoUpdate = enabled; SaveSettings(); ConfigureUpdateTimer();
+        if (enabled) _ = CheckForUpdate();
+        return new { enabled };
+    }
+
+    private object QueueRetry()
+    {
+        consecutiveConnectionFailures = 0; pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue; lastConnectionError = "";
+        NextTick(StartConnectionLoop);
+        return new { accepted = true };
     }
 
     private static string WarningUi(ulong userId) => "RustOps.Warning." + userId;
@@ -506,7 +580,13 @@ public class RustOpsCompanion : CarbonPlugin
     {
         if (socket?.State != WebSocketState.Open) return;
         var bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(message));
-        await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, shutdown.Token);
+        await sendLock.WaitAsync(shutdown.Token);
+        try
+        {
+            if (socket?.State == WebSocketState.Open)
+                await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, shutdown.Token);
+        }
+        finally { sendLock.Release(); }
     }
 
     private void LoadSettings()
