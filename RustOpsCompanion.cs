@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.6.2")]
+[Info("RustOpsCompanion", "RustOps", "0.6.3")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.6.2";
-    private const string CompanionBuild = "2026.07.11.2";
+    private const string CompanionVersion = "0.6.3";
+    private const string CompanionBuild = "2026.07.12.1";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
@@ -50,6 +50,7 @@ public class RustOpsCompanion : CarbonPlugin
         public string ServiceUrl = "wss://your-rustops-domain/v1/carbon/connect";
         public string DeviceToken = "";
         public bool AutoUpdate = false;
+        public string UpdateChannel = "stable";
     }
 
     private sealed class PluginSummary
@@ -189,7 +190,8 @@ public class RustOpsCompanion : CarbonPlugin
         $"Last error: {(string.IsNullOrWhiteSpace(lastConnectionError) ? "none" : lastConnectionError)}\n" +
         $"Service: {settings?.ServiceUrl ?? "Not configured"}\n" +
         $"Auto update: {(settings?.AutoUpdate == true ? "enabled" : "disabled")}\n" +
-        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.status, companion.autoupdate, companion.retry");
+        $"Update channel: {settings?.UpdateChannel ?? "stable"}\n" +
+        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.status, companion.autoupdate, companion.retry, companion.channel");
 
     [ConsoleCommand("rustops.autoupdate")]
     private void AutoUpdate(ConsoleSystem.Arg arg)
@@ -227,6 +229,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.6.3: Per-server stable/beta update channels with signed channel manifests.\n" +
         "v0.6.2: Treats stable proxy/server WebSocket closes as normal reconnects instead of noisy last-error failures.\n" +
         "v0.6.1: Detects already-loaded plugins on startup and fixes update manifest compatibility.\n" +
         "v0.6.0: Strict protocol handling, serialized WebSocket sends, remote status/update controls, and atomic config rollback.\n" +
@@ -274,7 +277,7 @@ public class RustOpsCompanion : CarbonPlugin
                 var connectedAtUtc = DateTime.UtcNow;
                 pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue;
                 AnnounceConnected();
-                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
+                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry", "companion.channel" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate, updateChannel = settings.UpdateChannel }) });
                 try { await ReceiveLoop(generation, socket); }
                 catch (WebSocketException error) when (IsUncleanRemoteClose(error))
                 {
@@ -399,6 +402,7 @@ public class RustOpsCompanion : CarbonPlugin
                 "companion.status" => CompanionStatus(),
                 "companion.autoupdate" => SetAutoUpdate(request),
                 "companion.retry" => QueueRetry(),
+                "companion.channel" => SetUpdateChannel(request),
                 _ => throw new InvalidOperationException("Unsupported operation.")
             };
             await Send(new ProtocolMessage { RequestId = request.RequestId, Operation = request.Operation, Success = true, Payload = payload == null ? null : JToken.FromObject(payload) });
@@ -539,7 +543,17 @@ public class RustOpsCompanion : CarbonPlugin
         nextRetry = RetryLabel(),
         lastError = lastConnectionError,
         autoUpdate = settings?.AutoUpdate == true
+        ,updateChannel = settings?.UpdateChannel ?? "stable"
     };
+
+    private object SetUpdateChannel(ProtocolMessage request)
+    {
+        var channel = request.Payload?["channel"]?.Value<string>()?.ToLowerInvariant();
+        if (channel != "stable" && channel != "beta") throw new InvalidDataException("Update channel must be stable or beta.");
+        settings.UpdateChannel = channel; SaveSettings();
+        if (settings.AutoUpdate) _ = CheckForUpdate();
+        return new { channel };
+    }
 
     private object SetAutoUpdate(ProtocolMessage request)
     {
@@ -601,7 +615,8 @@ public class RustOpsCompanion : CarbonPlugin
             var scheme = service.Scheme == "wss" ? "https" : "http";
             var origin = new UriBuilder(scheme, service.Host, service.IsDefaultPort ? -1 : service.Port).Uri;
             using var web = new WebClient();
-            var manifestUri = new Uri(origin, "/downloads/release.json");
+            var channel = settings?.UpdateChannel == "beta" ? "beta" : "stable";
+            var manifestUri = new Uri(origin, "/v1/carbon/releases/" + channel);
             var manifest = JsonConvert.DeserializeObject<ReleaseManifest>(await web.DownloadStringTaskAsync(manifestUri));
             if (manifest == null || string.IsNullOrWhiteSpace(manifest.version) || string.IsNullOrWhiteSpace(manifest.sourceUrl) || string.IsNullOrWhiteSpace(manifest.sha256)) throw new InvalidDataException("Invalid update manifest.");
             if (!System.Version.TryParse(manifest.version, out var available) || !System.Version.TryParse(CompanionVersion, out var installed)) throw new InvalidDataException("Invalid release version.");

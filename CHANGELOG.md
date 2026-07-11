@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 — 2026-07-12
+
+- Adds stable and beta update channels controlled per paired server.
+- Reports and persists the selected release channel.
+- Fetches channel-specific SHA-256 manifests from the RustOps control plane.
+
 ## 0.6.2 — 2026-07-11
 
 - Treats stable proxy/server WebSocket closes as normal reconnects.
