@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.6.0")]
+[Info("RustOpsCompanion", "RustOps", "0.6.1")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.6.0";
-    private const string CompanionBuild = "2026.07.10.2";
+    private const string CompanionVersion = "0.6.1";
+    private const string CompanionBuild = "2026.07.11.1";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
@@ -87,6 +87,7 @@ public class RustOpsCompanion : CarbonPlugin
     private void OnServerInitialized()
     {
         LoadSettings();
+        RefreshLoadedPluginsFromRuntime();
         if (!string.IsNullOrWhiteSpace(settings.DeviceToken)) StartConnectionLoop();
         ConfigureUpdateTimer();
     }
@@ -121,6 +122,46 @@ public class RustOpsCompanion : CarbonPlugin
     {
         try { return plugin?.GetType().GetProperty("Name")?.GetValue(plugin, null)?.ToString(); }
         catch { return null; }
+    }
+
+    private void RefreshLoadedPluginsFromRuntime()
+    {
+        try
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = assembly.GetTypes(); }
+                catch (System.Reflection.ReflectionTypeLoadException error) { types = error.Types.Where(type => type != null).ToArray(); }
+                catch { continue; }
+                foreach (var type in types)
+                {
+                    if (type == null || type.IsAbstract || (!typeof(CarbonPlugin).IsAssignableFrom(type) && !InheritsTypeNamed(type, "RustPlugin"))) continue;
+                    AddLoadedPluginName(type.Name);
+                    foreach (var attribute in type.GetCustomAttributes(false))
+                    {
+                        var attributeType = attribute.GetType();
+                        if (!string.Equals(attributeType.Name, "InfoAttribute", StringComparison.OrdinalIgnoreCase)) continue;
+                        foreach (var propertyName in new[] { "Name", "Title", "PluginName" })
+                            AddLoadedPluginName(attributeType.GetProperty(propertyName)?.GetValue(attribute, null)?.ToString());
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void AddLoadedPluginName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+        loadedPlugins.Add(Path.GetFileNameWithoutExtension(name));
+    }
+
+    private static bool InheritsTypeNamed(Type type, string name)
+    {
+        for (var current = type.BaseType; current != null; current = current.BaseType)
+            if (string.Equals(current.Name, name, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
     }
 
     [ConsoleCommand("rustops.pair")]
@@ -186,6 +227,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.6.1: Detects already-loaded plugins on startup and fixes update manifest compatibility.\n" +
         "v0.6.0: Strict protocol handling, serialized WebSocket sends, remote status/update controls, and atomic config rollback.\n" +
         "v0.5.5: Short-lived WebSocket connections now count as failures; connection logs are throttled.\n" +
         "v0.5.4: Smarter WebSocket reconnect backoff, pause-after-failures, rustops.retry command, and clearer status.\n" +
@@ -362,6 +404,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     private object ListPlugins()
     {
+        RefreshLoadedPluginsFromRuntime();
         var root = Path.GetFullPath(Path.Combine("carbon", "plugins"));
         if (!Directory.Exists(root)) return new { plugins = Array.Empty<PluginSummary>() };
         var plugins = new List<PluginSummary>();

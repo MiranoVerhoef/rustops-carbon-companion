@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1 — 2026-07-11
+
+- Detects already-loaded Carbon/uMod-style plugins when the companion starts.
+- Keeps plugin loaded state fresh when the dashboard lists plugins.
+- Updates the signed release manifest so verified updates match the served source file.
+
 ## 0.6.0 — 2026-07-10
 
 - Rejects incompatible or malformed control-plane protocol messages clearly.
