@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2 — 2026-07-11
+
+- Treats stable proxy/server WebSocket closes as normal reconnects.
+- Keeps short-lived unclean closes as real failures so bad proxy routing remains visible.
+
 ## 0.6.1 — 2026-07-11
 
 - Detects already-loaded Carbon/uMod-style plugins when the companion starts.

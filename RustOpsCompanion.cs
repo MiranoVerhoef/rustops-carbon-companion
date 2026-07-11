@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.6.1")]
+[Info("RustOpsCompanion", "RustOps", "0.6.2")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.6.1";
-    private const string CompanionBuild = "2026.07.11.1";
+    private const string CompanionVersion = "0.6.2";
+    private const string CompanionBuild = "2026.07.11.2";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
@@ -227,6 +227,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.6.2: Treats stable proxy/server WebSocket closes as normal reconnects instead of noisy last-error failures.\n" +
         "v0.6.1: Detects already-loaded plugins on startup and fixes update manifest compatibility.\n" +
         "v0.6.0: Strict protocol handling, serialized WebSocket sends, remote status/update controls, and atomic config rollback.\n" +
         "v0.5.5: Short-lived WebSocket connections now count as failures; connection logs are throttled.\n" +
@@ -274,7 +275,12 @@ public class RustOpsCompanion : CarbonPlugin
                 pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue;
                 AnnounceConnected();
                 await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate }) });
-                await ReceiveLoop(generation, socket);
+                try { await ReceiveLoop(generation, socket); }
+                catch (WebSocketException error) when (IsUncleanRemoteClose(error))
+                {
+                    var seconds = (DateTime.UtcNow - connectedAtUtc).TotalSeconds;
+                    if (seconds < StableConnectionSeconds) throw new WebSocketException($"WebSocket closed uncleanly after {Math.Max(1, (int)seconds)} second(s).");
+                }
                 if (generation != connectionGeneration || shutdown.IsCancellationRequested) return;
                 var connectedSeconds = (DateTime.UtcNow - connectedAtUtc).TotalSeconds;
                 if (connectedSeconds < StableConnectionSeconds)
@@ -330,6 +336,7 @@ public class RustOpsCompanion : CarbonPlugin
     private static TimeSpan TimeUntil(DateTime utc) => TimeSpan.FromMilliseconds(Math.Max(1000, (utc - DateTime.UtcNow).TotalMilliseconds));
     private string ConnectionLabel() => pausedUntilUtc > DateTime.UtcNow ? "Paused" : socket?.State.ToString() ?? "Not started";
     private string RetryLabel() => nextRetryUtc > DateTime.UtcNow ? nextRetryUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "not scheduled";
+    private static bool IsUncleanRemoteClose(WebSocketException error) => error.Message.IndexOf("without completing the close handshake", StringComparison.OrdinalIgnoreCase) >= 0;
 
     private static bool IsAllowedServiceUri(Uri uri)
     {
