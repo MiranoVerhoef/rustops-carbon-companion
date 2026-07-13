@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1 — 2026-07-13
+
+- Blocks movement, attacks, and interaction while an admin warning is waiting for acknowledgement.
+- Restores an unacknowledged warning after the player reconnects.
+
 ## 0.8.0 — 2026-07-13
 
 - Reports the plugin version stored in every retained source revision.

@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.8.0")]
+[Info("RustOpsCompanion", "RustOps", "0.8.1")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.8.0";
-    private const string CompanionBuild = "2026.07.13.4";
+    private const string CompanionVersion = "0.8.1";
+    private const string CompanionBuild = "2026.07.13.5";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int MaxPluginBytes = 512 * 1024;
     private const int StableConnectionSeconds = 30;
@@ -87,7 +87,7 @@ public class RustOpsCompanion : CarbonPlugin
         public string sha256;
     }
 
-    private sealed class PendingWarning { public string Token; public string WarningId; }
+    private sealed class PendingWarning { public string Token; public string WarningId; public string Message; }
 
     private void OnServerInitialized()
     {
@@ -125,6 +125,20 @@ public class RustOpsCompanion : CarbonPlugin
     private void OnPluginUnloaded(object plugin)
     {
         foreach (var name in PluginObjectNames(plugin)) MarkPluginState(name, false);
+    }
+
+    private object OnPlayerInput(BasePlayer player, InputState input)
+    {
+        if (player == null || input == null || !pendingWarnings.ContainsKey(player.userID)) return null;
+        input.current.buttons = 0;
+        input.previous.buttons = 0;
+        return true;
+    }
+
+    private void OnPlayerConnected(BasePlayer player)
+    {
+        if (player == null || !pendingWarnings.TryGetValue(player.userID, out var warning)) return;
+        NextTick(() => ShowWarning(player, warning.Message, warning.Token));
     }
 
     private static string[] PluginObjectNames(object plugin)
@@ -269,6 +283,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.8.1: Warning acknowledgement blocks player input until the note is read.\n" +
         "v0.8.0: Versioned plugin revisions with plan-controlled retention.\n" +
         "v0.7.2: Backup downloads, permanent deletion, and multi-upload support.\n" +
         "v0.7.1: Verified Carbon lifecycle state; no stale loaded-state or false-success reports.\n" +
@@ -669,7 +684,7 @@ public class RustOpsCompanion : CarbonPlugin
         if (string.IsNullOrWhiteSpace(message) || message.Length > 512) throw new InvalidDataException("Warning message required (maximum 512 characters).");
         if (string.IsNullOrWhiteSpace(warningId)) throw new InvalidDataException("Warning ID required.");
         var player = BasePlayer.FindByID(id); if (player == null || !player.IsConnected) throw new InvalidOperationException("Player is not online.");
-        var token = Guid.NewGuid().ToString("N"); pendingWarnings[id] = new PendingWarning { Token = token, WarningId = warningId };
+        var token = Guid.NewGuid().ToString("N"); pendingWarnings[id] = new PendingWarning { Token = token, WarningId = warningId, Message = message };
         ShowWarning(player, message, token); return new { delivered = true, steamId, warningId };
     }
 
