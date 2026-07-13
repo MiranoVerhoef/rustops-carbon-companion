@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.2 — 2026-07-13
+
+- Freezes warned players client-side until acknowledgement, avoiding movement rubber-banding.
+- Reliably removes the freeze after acknowledgement or companion unload.
+
 ## 0.8.1 — 2026-07-13
 
 - Blocks movement, attacks, and interaction while an admin warning is waiting for acknowledgement.
