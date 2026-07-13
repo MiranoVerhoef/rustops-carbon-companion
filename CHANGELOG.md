@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.1 — 2026-07-13
+
+- Verifies load, unload, and reload against Carbon lifecycle events before reporting success.
+- Stops stale loaded assemblies from changing unloaded plugins back to loaded in the dashboard.
+- Reports a clear failure when Carbon does not reach the requested plugin state.
+
+## 0.7.0 — 2026-07-13
+
+- Adds premium plugin source upload, download, and deletion.
+- Creates an automatic backup before every replacement or deletion.
+- Retains five source versions per plugin and supports dashboard restore.
+- Restricts file access to top-level `.cs` files in the canonical Carbon plugin directory.
+
 ## 0.6.3 — 2026-07-12
 
 - Adds stable and beta update channels controlled per paired server.

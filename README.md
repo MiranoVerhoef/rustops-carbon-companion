@@ -2,7 +2,7 @@
 
 Open-source Carbon production-channel companion. It opens only an outbound WSS connection and never exposes a new inbound port.
 
-Current version: **0.6.3** · Protocol: **v1**
+Current version: **0.7.1** · Protocol: **v1**
 
 1. Copy `RustOpsCompanion.cs` to `carbon/plugins`.
 2. In dashboard, generate pairing code.
@@ -20,6 +20,8 @@ Commands:
 - `rustops.changelog` — changes included in installed releases.
 
 Device token is stored in `carbon/configs/RustOpsCompanion.json`. Re-pairing rotates it. Plugin config access is constrained to JSON files inside Carbon configs directory, capped at 2 MiB, written atomically, and retains five backups.
+
+Premium source-file management is constrained to top-level `.cs` files inside `carbon/plugins`, capped at 512 KiB. Replacements and deletions create server-local backups; five versions per plugin are retained for restore.
 
 ## Security
 

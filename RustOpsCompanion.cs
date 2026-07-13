@@ -18,14 +18,15 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.6.3")]
+[Info("RustOpsCompanion", "RustOps", "0.7.1")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.6.3";
-    private const string CompanionBuild = "2026.07.12.1";
+    private const string CompanionVersion = "0.7.1";
+    private const string CompanionBuild = "2026.07.13.2";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
+    private const int MaxPluginBytes = 512 * 1024;
     private const int StableConnectionSeconds = 30;
     private readonly CancellationTokenSource shutdown = new();
     private readonly SemaphoreSlim sendLock = new(1, 1);
@@ -42,7 +43,9 @@ public class RustOpsCompanion : CarbonPlugin
     private readonly Dictionary<ulong, PendingWarning> pendingWarnings = new();
     private readonly Dictionary<string, string> compileErrors = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> loadedPlugins = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> pluginStateVersions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly string ConfigRoot = Path.Combine("carbon", "configs");
+    private static readonly string PluginRoot = Path.Combine("carbon", "plugins");
     private string SettingsPath => Path.Combine(ConfigRoot, "RustOpsCompanion.json");
 
     private sealed class CompanionSettings
@@ -62,6 +65,7 @@ public class RustOpsCompanion : CarbonPlugin
         public string state;
         public string description;
         public bool hasConfig;
+        public bool fileExists;
         public string compileError;
     }
 
@@ -104,31 +108,67 @@ public class RustOpsCompanion : CarbonPlugin
     private void OnPluginCompileFailure(string plugin, Exception error)
     {
         if (string.IsNullOrWhiteSpace(plugin)) return;
-        compileErrors[Path.GetFileNameWithoutExtension(plugin)] = error?.Message ?? "Compilation failed.";
-        loadedPlugins.Remove(Path.GetFileNameWithoutExtension(plugin));
+        var name = Path.GetFileNameWithoutExtension(plugin);
+        compileErrors[name] = error?.Message ?? "Compilation failed.";
+        MarkPluginState(name, false);
     }
 
     private void OnPluginLoaded(object plugin)
     {
-        var name = PluginObjectName(plugin); if (string.IsNullOrWhiteSpace(name)) return;
-        compileErrors.Remove(name); loadedPlugins.Add(name);
+        foreach (var name in PluginObjectNames(plugin))
+        {
+            compileErrors.Remove(name);
+            MarkPluginState(name, true);
+        }
     }
 
     private void OnPluginUnloaded(object plugin)
     {
-        var name = PluginObjectName(plugin); if (!string.IsNullOrWhiteSpace(name)) loadedPlugins.Remove(name);
+        foreach (var name in PluginObjectNames(plugin)) MarkPluginState(name, false);
     }
 
-    private static string PluginObjectName(object plugin)
+    private static string[] PluginObjectNames(object plugin)
     {
-        try { return plugin?.GetType().GetProperty("Name")?.GetValue(plugin, null)?.ToString(); }
-        catch { return null; }
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Action<object> add = value =>
+        {
+            var text = value?.ToString();
+            if (string.IsNullOrWhiteSpace(text)) return;
+            text = Path.GetFileNameWithoutExtension(text.Trim());
+            if (string.IsNullOrWhiteSpace(text)) return;
+            names.Add(text);
+            var compact = Regex.Replace(text, "\\s+", "");
+            if (!string.IsNullOrWhiteSpace(compact)) names.Add(compact);
+        };
+        try
+        {
+            add(plugin);
+            var type = plugin?.GetType();
+            if (type != null)
+            {
+                add(type.Name);
+                foreach (var propertyName in new[] { "Name", "Title", "FileName", "Filename", "Path" })
+                    try { add(type.GetProperty(propertyName)?.GetValue(plugin, null)); } catch { }
+            }
+        }
+        catch { }
+        return names.ToArray();
+    }
+
+    private void MarkPluginState(string name, bool loaded)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+        if (loaded) loadedPlugins.Add(name); else loadedPlugins.Remove(name);
+        pluginStateVersions.TryGetValue(name, out var version);
+        pluginStateVersions[name] = version + 1;
     }
 
     private void RefreshLoadedPluginsFromRuntime()
     {
         try
         {
+            loadedPlugins.Clear();
+            pluginStateVersions.Clear();
             foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
             {
                 Type[] types;
@@ -155,7 +195,7 @@ public class RustOpsCompanion : CarbonPlugin
     private void AddLoadedPluginName(string name)
     {
         if (string.IsNullOrWhiteSpace(name)) return;
-        loadedPlugins.Add(Path.GetFileNameWithoutExtension(name));
+        MarkPluginState(Path.GetFileNameWithoutExtension(name), true);
     }
 
     private static bool InheritsTypeNamed(Type type, string name)
@@ -191,7 +231,7 @@ public class RustOpsCompanion : CarbonPlugin
         $"Service: {settings?.ServiceUrl ?? "Not configured"}\n" +
         $"Auto update: {(settings?.AutoUpdate == true ? "enabled" : "disabled")}\n" +
         $"Update channel: {settings?.UpdateChannel ?? "stable"}\n" +
-        "Capabilities: plugins.list, plugins.lifecycle, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.status, companion.autoupdate, companion.retry, companion.channel");
+        "Capabilities: plugins.list, plugins.lifecycle, plugins.files, config.read, config.write, config.rollback, player.warn, chat.send, companion.update, companion.status, companion.autoupdate, companion.retry, companion.channel");
 
     [ConsoleCommand("rustops.autoupdate")]
     private void AutoUpdate(ConsoleSystem.Arg arg)
@@ -229,6 +269,8 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.7.1: Verified Carbon lifecycle state; no stale loaded-state or false-success reports.\n" +
+        "v0.7.0: Premium plugin upload, download, delete, five-version backup, and restore.\n" +
         "v0.6.3: Per-server stable/beta update channels with signed channel manifests.\n" +
         "v0.6.2: Treats stable proxy/server WebSocket closes as normal reconnects instead of noisy last-error failures.\n" +
         "v0.6.1: Detects already-loaded plugins on startup and fixes update manifest compatibility.\n" +
@@ -277,7 +319,7 @@ public class RustOpsCompanion : CarbonPlugin
                 var connectedAtUtc = DateTime.UtcNow;
                 pausedUntilUtc = DateTime.MinValue; nextRetryUtc = DateTime.MinValue;
                 AnnounceConnected();
-                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry", "companion.channel" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate, updateChannel = settings.UpdateChannel }) });
+                await Send(new ProtocolMessage { RequestId = Guid.NewGuid().ToString(), Operation = "hello", Capabilities = new[] { "plugins.list", "plugins.lifecycle", "plugins.files", "config.read", "config.write", "config.rollback", "player.warn", "chat.send", "companion.update", "companion.status", "companion.autoupdate", "companion.retry", "companion.channel" }, Payload = JObject.FromObject(new { carbonVersion = typeof(CarbonPlugin).Assembly.GetName().Version?.ToString() ?? "unknown", companionVersion = CompanionVersion, companionBuild = CompanionBuild, autoUpdate = settings.AutoUpdate, updateChannel = settings.UpdateChannel }) });
                 try { await ReceiveLoop(generation, socket); }
                 catch (WebSocketException error) when (IsUncleanRemoteClose(error))
                 {
@@ -393,6 +435,11 @@ public class RustOpsCompanion : CarbonPlugin
                 "plugins.load" => await RunLifecycle("load", request),
                 "plugins.unload" => await RunLifecycle("unload", request),
                 "plugins.reload" => await RunLifecycle("reload", request),
+                "plugins.file.read" => ReadPlugin(PluginName(request)),
+                "plugins.file.write" => WritePlugin(PluginName(request), request),
+                "plugins.file.delete" => await DeletePlugin(PluginName(request)),
+                "plugins.backups.list" => ListPluginBackups(PluginName(request)),
+                "plugins.backups.restore" => RestorePluginBackup(PluginName(request), request),
                 "config.read" => ReadConfig(PluginName(request)),
                 "config.write" => WriteConfig(PluginName(request), request),
                 "config.rollback" => RollbackConfig(PluginName(request)),
@@ -415,7 +462,6 @@ public class RustOpsCompanion : CarbonPlugin
 
     private object ListPlugins()
     {
-        RefreshLoadedPluginsFromRuntime();
         var root = Path.GetFullPath(Path.Combine("carbon", "plugins"));
         if (!Directory.Exists(root)) return new { plugins = Array.Empty<PluginSummary>() };
         var plugins = new List<PluginSummary>();
@@ -431,11 +477,19 @@ public class RustOpsCompanion : CarbonPlugin
                 name = info.Success ? info.Groups[1].Value : Path.GetFileNameWithoutExtension(file),
                 author = info.Success ? info.Groups[2].Value : "Unknown",
                 version = info.Success ? info.Groups[3].Value : "Unknown",
-                state = !string.IsNullOrWhiteSpace(compileError) ? "compile_error" : loadedPlugins.Contains(id) ? "loaded" : "installed",
+                state = !string.IsNullOrWhiteSpace(compileError) ? "compile_error" : loadedPlugins.Contains(id) ? "loaded" : "unloaded",
                 description = description.Success ? description.Groups[1].Value : "",
                 hasConfig = File.Exists(ResolveConfigPath(id)),
+                fileExists = true,
                 compileError = compileError
             });
+        }
+        var backupRoot = Path.Combine(PluginRoot, ".rustops-backups");
+        if (Directory.Exists(backupRoot)) foreach (var folder in new DirectoryInfo(backupRoot).GetDirectories())
+        {
+            var id = folder.Name;
+            if (plugins.Any(item => string.Equals(item.id, id, StringComparison.OrdinalIgnoreCase)) || !Regex.IsMatch(id, "^[A-Za-z0-9_-]{1,128}$") || folder.GetFiles("*.cs.bak").Length == 0) continue;
+            plugins.Add(new PluginSummary { id = id, name = id, author = "Backup", version = "—", state = "deleted_backup", description = "Deleted plugin with a RustOps backup available.", hasConfig = File.Exists(ResolveConfigPath(id)), fileExists = false });
         }
         return new { plugins = plugins.OrderBy(plugin => plugin.name).ToArray() };
     }
@@ -443,7 +497,27 @@ public class RustOpsCompanion : CarbonPlugin
     private async Task<object> RunLifecycle(string action, ProtocolMessage request)
     {
         var plugin = PluginName(request);
-        return await OnMainThread(() => new { output = ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet(), $"c.{action} \"{plugin}\"") });
+        var before = await OnMainThread(() => new
+        {
+            loaded = loadedPlugins.Contains(plugin),
+            version = pluginStateVersions.TryGetValue(plugin, out var value) ? value : 0
+        });
+        var output = await OnMainThread(() => ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet(), $"c.{action} \"{plugin}\""));
+        var expectedLoaded = action != "unload";
+        for (var attempt = 0; attempt < 16; attempt++)
+        {
+            await Task.Delay(250);
+            var current = await OnMainThread(() => new
+            {
+                loaded = loadedPlugins.Contains(plugin),
+                version = pluginStateVersions.TryGetValue(plugin, out var value) ? value : 0
+            });
+            var changed = current.version > before.version;
+            var alreadyCorrect = current.loaded == expectedLoaded && before.loaded == expectedLoaded && action != "reload";
+            if (current.loaded == expectedLoaded && (changed || alreadyCorrect))
+                return new { output, state = current.loaded ? "loaded" : "unloaded", verified = true };
+        }
+        throw new InvalidOperationException($"Carbon did not confirm that plugin '{plugin}' was {(expectedLoaded ? "loaded" : "unloaded")}.");
     }
 
     private string PluginName(ProtocolMessage request)
@@ -461,6 +535,67 @@ public class RustOpsCompanion : CarbonPlugin
         var path = Path.GetFullPath(Path.Combine(root, plugin + ".json"));
         if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Config path escaped root.");
         return path;
+    }
+
+    private string PluginPath(string plugin)
+    {
+        var root = Path.GetFullPath(PluginRoot) + Path.DirectorySeparatorChar;
+        var path = Path.GetFullPath(Path.Combine(root, plugin + ".cs"));
+        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Plugin path escaped root.");
+        return path;
+    }
+
+    private object ReadPlugin(string plugin)
+    {
+        var path = PluginPath(plugin); if (!File.Exists(path)) throw new FileNotFoundException($"Plugin '{plugin}' was not found.");
+        var bytes = File.ReadAllBytes(path); if (bytes.Length > MaxPluginBytes) throw new InvalidDataException("Plugin exceeds 512 KiB.");
+        return new { source = Encoding.UTF8.GetString(bytes), revision = Revision(bytes), size = bytes.Length };
+    }
+
+    private object WritePlugin(string plugin, ProtocolMessage request)
+    {
+        var source = request.Payload?["source"]?.Value<string>(); if (string.IsNullOrWhiteSpace(source)) throw new InvalidDataException("Plugin source required.");
+        var bytes = Encoding.UTF8.GetBytes(source); if (bytes.Length > MaxPluginBytes) throw new InvalidDataException("Plugin exceeds 512 KiB.");
+        var path = PluginPath(plugin); Directory.CreateDirectory(PluginRoot); var backedUp = File.Exists(path);
+        if (backedUp)
+        {
+            var current = File.ReadAllBytes(path); var expected = request.Payload?["revision"]?.Value<string>();
+            if (!string.Equals(expected, Revision(current), StringComparison.Ordinal)) throw new InvalidOperationException("Plugin changed since it was opened.");
+            BackupPlugin(plugin, current);
+        }
+        var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
+        if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
+        return new { revision = Revision(bytes), size = bytes.Length, backedUp };
+    }
+
+    private async Task<object> DeletePlugin(string plugin)
+    {
+        var path = PluginPath(plugin); if (!File.Exists(path)) throw new FileNotFoundException($"Plugin '{plugin}' was not found.");
+        var current = File.ReadAllBytes(path); BackupPlugin(plugin, current);
+        await OnMainThread(() => ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet(), $"c.unload \"{plugin}\""));
+        File.Delete(path); loadedPlugins.Remove(plugin);
+        return new { deleted = true, backupCreated = true };
+    }
+
+    private object ListPluginBackups(string plugin)
+    {
+        var folder = PluginBackupFolder(plugin); var backups = new List<object>();
+        if (Directory.Exists(folder)) foreach (var file in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(item => item.Name)) backups.Add(new { id = file.Name, createdAt = file.CreationTimeUtc, size = file.Length });
+        return new { backups = backups.ToArray() };
+    }
+
+    private object RestorePluginBackup(string plugin, ProtocolMessage request)
+    {
+        var backup = request.Payload?["backup"]?.Value<string>();
+        if (string.IsNullOrWhiteSpace(backup) || !Regex.IsMatch(backup, "^[0-9]{17}\\.cs\\.bak$")) throw new InvalidDataException("Invalid plugin backup.");
+        var folder = Path.GetFullPath(PluginBackupFolder(plugin)) + Path.DirectorySeparatorChar;
+        var source = Path.GetFullPath(Path.Combine(folder, backup));
+        if (!source.StartsWith(folder, StringComparison.OrdinalIgnoreCase) || !File.Exists(source)) throw new FileNotFoundException("Plugin backup not found.");
+        var path = PluginPath(plugin); var bytes = File.ReadAllBytes(source);
+        if (File.Exists(path)) BackupPlugin(plugin, File.ReadAllBytes(path));
+        Directory.CreateDirectory(PluginRoot); var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
+        if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
+        return new { restored = true, revision = Revision(bytes), size = bytes.Length };
     }
 
     private string ResolveConfigPath(string plugin)
@@ -593,6 +728,13 @@ public class RustOpsCompanion : CarbonPlugin
     }
 
     private string BackupFolder(string plugin) => Path.Combine(ConfigRoot, ".rustops-backups", plugin);
+    private string PluginBackupFolder(string plugin) => Path.Combine(PluginRoot, ".rustops-backups", plugin);
+    private void BackupPlugin(string plugin, byte[] bytes)
+    {
+        var folder = PluginBackupFolder(plugin); Directory.CreateDirectory(folder);
+        File.WriteAllBytes(Path.Combine(folder, DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".cs.bak"), bytes);
+        foreach (var old in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(file => file.Name).Skip(5)) old.Delete();
+    }
     private void Backup(string plugin, byte[] bytes)
     {
         var folder = BackupFolder(plugin); Directory.CreateDirectory(folder);
