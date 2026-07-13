@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.7.2")]
+[Info("RustOpsCompanion", "RustOps", "0.8.0")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.7.2";
-    private const string CompanionBuild = "2026.07.13.3";
+    private const string CompanionVersion = "0.8.0";
+    private const string CompanionBuild = "2026.07.13.4";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int MaxPluginBytes = 512 * 1024;
     private const int StableConnectionSeconds = 30;
@@ -269,6 +269,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.8.0: Versioned plugin revisions with plan-controlled retention.\n" +
         "v0.7.2: Backup downloads, permanent deletion, and multi-upload support.\n" +
         "v0.7.1: Verified Carbon lifecycle state; no stale loaded-state or false-success reports.\n" +
         "v0.7.0: Premium plugin upload, download, delete, five-version backup, and restore.\n" +
@@ -438,7 +439,7 @@ public class RustOpsCompanion : CarbonPlugin
                 "plugins.reload" => await RunLifecycle("reload", request),
                 "plugins.file.read" => ReadPlugin(PluginName(request)),
                 "plugins.file.write" => WritePlugin(PluginName(request), request),
-                "plugins.file.delete" => await DeletePlugin(PluginName(request)),
+                "plugins.file.delete" => await DeletePlugin(PluginName(request), request),
                 "plugins.backups.list" => ListPluginBackups(PluginName(request)),
                 "plugins.backups.read" => ReadPluginBackup(PluginName(request), request),
                 "plugins.backups.restore" => RestorePluginBackup(PluginName(request), request),
@@ -564,17 +565,17 @@ public class RustOpsCompanion : CarbonPlugin
         {
             var current = File.ReadAllBytes(path); var expected = request.Payload?["revision"]?.Value<string>();
             if (!string.Equals(expected, Revision(current), StringComparison.Ordinal)) throw new InvalidOperationException("Plugin changed since it was opened.");
-            BackupPlugin(plugin, current);
+            BackupPlugin(plugin, current, RevisionLimit(request));
         }
         var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
         if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
         return new { revision = Revision(bytes), size = bytes.Length, backedUp };
     }
 
-    private async Task<object> DeletePlugin(string plugin)
+    private async Task<object> DeletePlugin(string plugin, ProtocolMessage request)
     {
         var path = PluginPath(plugin); if (!File.Exists(path)) throw new FileNotFoundException($"Plugin '{plugin}' was not found.");
-        var current = File.ReadAllBytes(path); BackupPlugin(plugin, current);
+        var current = File.ReadAllBytes(path); BackupPlugin(plugin, current, RevisionLimit(request));
         await OnMainThread(() => ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet(), $"c.unload \"{plugin}\""));
         File.Delete(path); loadedPlugins.Remove(plugin);
         return new { deleted = true, backupCreated = true };
@@ -583,7 +584,7 @@ public class RustOpsCompanion : CarbonPlugin
     private object ListPluginBackups(string plugin)
     {
         var folder = PluginBackupFolder(plugin); var backups = new List<object>();
-        if (Directory.Exists(folder)) foreach (var file in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(item => item.Name)) backups.Add(new { id = file.Name, createdAt = file.CreationTimeUtc, size = file.Length });
+        if (Directory.Exists(folder)) foreach (var file in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(item => item.Name)) backups.Add(new { id = file.Name, createdAt = file.CreationTimeUtc, size = file.Length, version = PluginSourceVersion(file.FullName) });
         return new { backups = backups.ToArray() };
     }
 
@@ -608,7 +609,7 @@ public class RustOpsCompanion : CarbonPlugin
     {
         var source = PluginBackupPath(plugin, request);
         var path = PluginPath(plugin); var bytes = File.ReadAllBytes(source);
-        if (File.Exists(path)) BackupPlugin(plugin, File.ReadAllBytes(path));
+        if (File.Exists(path)) BackupPlugin(plugin, File.ReadAllBytes(path), RevisionLimit(request));
         Directory.CreateDirectory(PluginRoot); var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
         if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
         return new { restored = true, revision = Revision(bytes), size = bytes.Length };
@@ -755,11 +756,26 @@ public class RustOpsCompanion : CarbonPlugin
 
     private string BackupFolder(string plugin) => Path.Combine(ConfigRoot, ".rustops-backups", plugin);
     private string PluginBackupFolder(string plugin) => Path.Combine(PluginRoot, ".rustops-backups", plugin);
-    private void BackupPlugin(string plugin, byte[] bytes)
+    private static int RevisionLimit(ProtocolMessage request)
+    {
+        var requested = request.Payload?["revisionLimit"]?.Value<int?>() ?? 5;
+        return Math.Max(1, Math.Min(50, requested));
+    }
+    private static string PluginSourceVersion(string path)
+    {
+        try
+        {
+            var source = File.ReadAllText(path);
+            var match = Regex.Match(source, "\\[Info\\s*\\(\\s*\"[^\"]*\"\\s*,\\s*\"[^\"]*\"\\s*,\\s*\"([^\"]+)\"");
+            return match.Success ? match.Groups[1].Value : "unknown";
+        }
+        catch { return "unknown"; }
+    }
+    private void BackupPlugin(string plugin, byte[] bytes, int limit)
     {
         var folder = PluginBackupFolder(plugin); Directory.CreateDirectory(folder);
         File.WriteAllBytes(Path.Combine(folder, DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".cs.bak"), bytes);
-        foreach (var old in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(file => file.Name).Skip(5)) old.Delete();
+        foreach (var old in new DirectoryInfo(folder).GetFiles("*.cs.bak").OrderByDescending(file => file.Name).Skip(limit)) old.Delete();
     }
     private void Backup(string plugin, byte[] bytes)
     {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 — 2026-07-13
+
+- Reports the plugin version stored in every retained source revision.
+- Enforces the organization's plan-specific revision retention limit.
+- Keeps revision metadata available for dashboard restore and download choices.
+
 ## 0.7.2 — 2026-07-13
 
 - Adds secure downloads for individual retained plugin source revisions.
