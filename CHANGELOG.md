@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.2 — 2026-07-13
+
+- Adds secure downloads for individual retained plugin source revisions.
+- Adds permanent deletion of retained source revisions and plugin configuration.
+- Supports the dashboard's multi-plugin upload and recovery workflow.
+
 ## 0.7.1 — 2026-07-13
 
 - Verifies load, unload, and reload against Carbon lifecycle events before reporting success.

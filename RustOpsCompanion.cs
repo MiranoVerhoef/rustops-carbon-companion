@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.7.1")]
+[Info("RustOpsCompanion", "RustOps", "0.7.2")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.7.1";
-    private const string CompanionBuild = "2026.07.13.2";
+    private const string CompanionVersion = "0.7.2";
+    private const string CompanionBuild = "2026.07.13.3";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int MaxPluginBytes = 512 * 1024;
     private const int StableConnectionSeconds = 30;
@@ -269,6 +269,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.7.2: Backup downloads, permanent deletion, and multi-upload support.\n" +
         "v0.7.1: Verified Carbon lifecycle state; no stale loaded-state or false-success reports.\n" +
         "v0.7.0: Premium plugin upload, download, delete, five-version backup, and restore.\n" +
         "v0.6.3: Per-server stable/beta update channels with signed channel manifests.\n" +
@@ -439,7 +440,9 @@ public class RustOpsCompanion : CarbonPlugin
                 "plugins.file.write" => WritePlugin(PluginName(request), request),
                 "plugins.file.delete" => await DeletePlugin(PluginName(request)),
                 "plugins.backups.list" => ListPluginBackups(PluginName(request)),
+                "plugins.backups.read" => ReadPluginBackup(PluginName(request), request),
                 "plugins.backups.restore" => RestorePluginBackup(PluginName(request), request),
+                "plugins.backups.purge" => PurgePluginBackups(PluginName(request)),
                 "config.read" => ReadConfig(PluginName(request)),
                 "config.write" => WriteConfig(PluginName(request), request),
                 "config.rollback" => RollbackConfig(PluginName(request)),
@@ -584,18 +587,41 @@ public class RustOpsCompanion : CarbonPlugin
         return new { backups = backups.ToArray() };
     }
 
-    private object RestorePluginBackup(string plugin, ProtocolMessage request)
+    private string PluginBackupPath(string plugin, ProtocolMessage request)
     {
         var backup = request.Payload?["backup"]?.Value<string>();
         if (string.IsNullOrWhiteSpace(backup) || !Regex.IsMatch(backup, "^[0-9]{17}\\.cs\\.bak$")) throw new InvalidDataException("Invalid plugin backup.");
         var folder = Path.GetFullPath(PluginBackupFolder(plugin)) + Path.DirectorySeparatorChar;
         var source = Path.GetFullPath(Path.Combine(folder, backup));
         if (!source.StartsWith(folder, StringComparison.OrdinalIgnoreCase) || !File.Exists(source)) throw new FileNotFoundException("Plugin backup not found.");
+        return source;
+    }
+
+    private object ReadPluginBackup(string plugin, ProtocolMessage request)
+    {
+        var source = PluginBackupPath(plugin, request); var bytes = File.ReadAllBytes(source);
+        if (bytes.Length > MaxPluginBytes) throw new InvalidDataException("Plugin backup exceeds 512 KiB.");
+        return new { source = Encoding.UTF8.GetString(bytes), revision = Revision(bytes), size = bytes.Length };
+    }
+
+    private object RestorePluginBackup(string plugin, ProtocolMessage request)
+    {
+        var source = PluginBackupPath(plugin, request);
         var path = PluginPath(plugin); var bytes = File.ReadAllBytes(source);
         if (File.Exists(path)) BackupPlugin(plugin, File.ReadAllBytes(path));
         Directory.CreateDirectory(PluginRoot); var temporary = path + ".rustops.tmp"; File.WriteAllBytes(temporary, bytes);
         if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
         return new { restored = true, revision = Revision(bytes), size = bytes.Length };
+    }
+
+    private object PurgePluginBackups(string plugin)
+    {
+        if (File.Exists(PluginPath(plugin))) throw new InvalidOperationException("Delete the installed plugin before permanently deleting its revisions.");
+        var folder = PluginBackupFolder(plugin);
+        if (!Directory.Exists(folder)) throw new DirectoryNotFoundException("No retained plugin revisions were found.");
+        Directory.Delete(folder, true);
+        var config = ResolveConfigPath(plugin); if (File.Exists(config)) File.Delete(config);
+        return new { purged = true, configDeleted = true };
     }
 
     private string ResolveConfigPath(string plugin)
