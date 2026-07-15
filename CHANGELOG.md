@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.3 — 2026-07-15
+
+- Adds blue and RustOps green dashboard chat-name colors.
+- Keeps the selected color consistent for Carbon and native RCON delivery.
+
 ## 0.8.2 — 2026-07-13
 
 - Freezes warned players client-side until acknowledgement, avoiding movement rubber-banding.

@@ -18,13 +18,13 @@ using Newtonsoft.Json.Linq;
 
 namespace Carbon.Plugins;
 
-[Info("RustOpsCompanion", "RustOps", "0.8.2")]
+[Info("RustOpsCompanion", "RustOps", "0.8.3")]
 [Description("Secure outbound companion for the RustOps hosted control plane.")]
 public class RustOpsCompanion : CarbonPlugin
 {
     private const int ProtocolVersion = 1;
-    private const string CompanionVersion = "0.8.2";
-    private const string CompanionBuild = "2026.07.13.6";
+    private const string CompanionVersion = "0.8.3";
+    private const string CompanionBuild = "2026.07.15.1";
     private const int MaxConfigBytes = 2 * 1024 * 1024;
     private const int MaxPluginBytes = 512 * 1024;
     private const int StableConnectionSeconds = 30;
@@ -287,6 +287,7 @@ public class RustOpsCompanion : CarbonPlugin
 
     [ConsoleCommand("rustops.changelog")]
     private void Changelog(ConsoleSystem.Arg arg) => arg.ReplyWith(
+        "v0.8.3: Blue or RustOps green dashboard chat sender names.\n" +
         "v0.8.2: Warnings freeze players client-side without movement rubber-banding.\n" +
         "v0.8.1: Warning acknowledgement blocks player input until the note is read.\n" +
         "v0.8.0: Versioned plugin revisions with plan-controlled retention.\n" +
@@ -697,12 +698,15 @@ public class RustOpsCompanion : CarbonPlugin
     {
         var name = request.Payload?["name"]?.Value<string>()?.Trim().TrimEnd(':');
         var message = request.Payload?["message"]?.Value<string>()?.Trim();
+        var nameColor = request.Payload?["nameColor"]?.Value<string>()?.Trim().ToLowerInvariant() ?? "blue";
         if (string.IsNullOrWhiteSpace(name) || name.Length > 32) throw new InvalidDataException("Chat name required (maximum 32 characters).");
         if (string.IsNullOrWhiteSpace(message) || message.Length > 512) throw new InvalidDataException("Chat message required (maximum 512 characters).");
+        if (nameColor != "blue" && nameColor != "green") throw new InvalidDataException("Chat name color must be blue or green.");
+        var colorHex = nameColor == "green" ? "#d7ff3f" : "#b8d9ff";
         foreach (var player in BasePlayer.activePlayerList)
-            player.SendConsoleCommand("chat.add", 2, 0, message, name, "#b8d9ff", 1.0);
+            player.SendConsoleCommand("chat.add", 2, 0, message, name, colorHex, 1.0);
         Puts($"[RustOps chat] {name}: {message}");
-        return new { delivered = true, name };
+        return new { delivered = true, name, nameColor };
     }
 
     private object QueueUpdate(ProtocolMessage request)
